@@ -32,15 +32,16 @@ def make_mock_http_handler(handler):
 @contextlib.contextmanager
 def mock_lancedb_connection(handler):
     with http.server.HTTPServer(
-        ("localhost", 8080), make_mock_http_handler(handler)
+        ("localhost", 0), make_mock_http_handler(handler)
     ) as server:
+        port = server.server_address[1]
         handle = threading.Thread(target=server.serve_forever)
         handle.start()
 
         db = lancedb.connect(
             "db://dev",
             api_key="fake",
-            host_override="http://localhost:8080",
+            host_override=f"http://localhost:{port}",
             client_config={
                 "retry_config": {"retries": 2},
                 "timeout_config": {
@@ -57,22 +58,24 @@ def mock_lancedb_connection(handler):
 
 
 @contextlib.asynccontextmanager
-async def mock_lancedb_connection_async(handler):
+async def mock_lancedb_connection_async(handler, **client_config):
     with http.server.HTTPServer(
-        ("localhost", 8080), make_mock_http_handler(handler)
+        ("localhost", 0), make_mock_http_handler(handler)
     ) as server:
+        port = server.server_address[1]
         handle = threading.Thread(target=server.serve_forever)
         handle.start()
 
         db = await lancedb.connect_async(
             "db://dev",
             api_key="fake",
-            host_override="http://localhost:8080",
+            host_override=f"http://localhost:{port}",
             client_config={
                 "retry_config": {"retries": 2},
                 "timeout_config": {
                     "connect_timeout": 1,
                 },
+                **client_config,
             },
         )
 
@@ -254,6 +257,9 @@ def test_table_create_indices():
                 )
             )
             request.wfile.write(payload.encode())
+        elif "/drop/" in request.path:
+            request.send_response(200)
+            request.end_headers()
         else:
             request.send_response(404)
             request.end_headers()
@@ -265,6 +271,9 @@ def test_table_create_indices():
         table.create_scalar_index("id")
         table.create_fts_index("text")
         table.create_scalar_index("vector")
+        table.drop_index("vector_idx")
+        table.drop_index("id_idx")
+        table.drop_index("text_idx")
 
 
 @contextlib.contextmanager
@@ -379,8 +388,14 @@ def test_query_sync_maximal():
 
 
 def test_query_sync_multiple_vectors():
-    def handler(_body):
-        return pa.table({"id": [1]})
+    def handler(body):
+        # TODO: we will add the ability to get the server version,
+        # so that we can decide how to perform batch quires.
+        vectors = body["vector"]
+        res = []
+        for i, vector in enumerate(vectors):
+            res.append({"id": 1, "query_index": i})
+        return pa.Table.from_pylist(res)
 
     with query_test_table(handler) as table:
         results = table.search([[1, 2, 3], [4, 5, 6]]).limit(1).to_list()
@@ -522,3 +537,19 @@ def test_create_client():
 
     with pytest.warns(DeprecationWarning):
         lancedb.connect(**mandatory_args, request_thread_pool=10)
+
+
+@pytest.mark.asyncio
+async def test_pass_through_headers():
+    def handler(request):
+        assert request.headers["foo"] == "bar"
+        request.send_response(200)
+        request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        request.wfile.write(b'{"tables": []}')
+
+    async with mock_lancedb_connection_async(
+        handler, extra_headers={"foo": "bar"}
+    ) as db:
+        table_names = await db.table_names()
+        assert table_names == []
