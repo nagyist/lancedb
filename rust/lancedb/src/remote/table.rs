@@ -4,6 +4,7 @@
 pub mod insert;
 
 use self::insert::RemoteInsertExec;
+use crate::expr::expr_to_sql_string;
 
 use super::client::RequestResultExt;
 use super::client::{HttpSend, RestfulLanceDbClient, Sender};
@@ -446,13 +447,17 @@ impl<S: HttpSend> RemoteTable<S> {
         body["k"] = serde_json::Value::Number(serde_json::Number::from(limit));
 
         if let Some(filter) = &params.filter {
-            if let QueryFilter::Sql(filter) = filter {
-                body["filter"] = serde_json::Value::String(filter.clone());
-            } else {
-                return Err(Error::NotSupported {
-                    message: "querying a remote table with a non-sql filter".to_string(),
-                });
-            }
+            let filter_sql = match filter {
+                QueryFilter::Sql(sql) => sql.clone(),
+                QueryFilter::Datafusion(expr) => expr_to_sql_string(expr)?,
+                QueryFilter::Substrait(_) => {
+                    return Err(Error::NotSupported {
+                        message: "Substrait filters are not supported for remote queries"
+                            .to_string(),
+                    });
+                }
+            };
+            body["filter"] = serde_json::Value::String(filter_sql);
         }
 
         match &params.select {
@@ -940,12 +945,12 @@ impl<S: HttpSend> BaseTable for RemoteTable<S> {
         let version = self.current_version().await;
 
         if let Some(filter) = filter {
-            let Filter::Sql(filter) = filter else {
-                return Err(Error::NotSupported {
-                    message: "querying a remote table with a datafusion filter".to_string(),
-                });
+            let filter_sql = match filter {
+                Filter::Sql(sql) => sql.clone(),
+                Filter::Datafusion(expr) => expr_to_sql_string(&expr)?,
             };
-            request = request.json(&serde_json::json!({ "predicate": filter, "version": version }));
+            request =
+                request.json(&serde_json::json!({ "predicate": filter_sql, "version": version }));
         } else {
             let body = serde_json::json!({ "version": version });
             request = request.json(&body);
@@ -4633,5 +4638,61 @@ mod tests {
         let result = table.add(batch).execute().await.unwrap();
         assert_eq!(result.version, 3);
         assert_eq!(attempt.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_query_with_datafusion_filter() {
+        use datafusion_expr::{col, lit};
+
+        let expected_data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let expected_data_ref = expected_data.clone();
+
+        let table = Table::new_with_handler("my_table", move |request| {
+            assert_eq!(request.method(), "POST");
+            assert_eq!(request.url().path(), "/v1/table/my_table/query/");
+
+            let body = request.body().unwrap().as_bytes().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+            // The Datafusion expression should be serialized to SQL
+            let filter = body.get("filter").expect("filter should be present");
+            let filter_str = filter.as_str().expect("filter should be a string");
+            // col("x") > lit(10) AND col("status") = lit("active")
+            assert!(
+                filter_str.contains("x") && filter_str.contains("10"),
+                "Filter should contain 'x' and '10', got: {}",
+                filter_str
+            );
+            assert!(
+                filter_str.contains("status") && filter_str.contains("active"),
+                "Filter should contain 'status' and 'active', got: {}",
+                filter_str
+            );
+
+            let response_body = write_ipc_file(&expected_data_ref);
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(response_body)
+                .unwrap()
+        });
+
+        // Use only_if_expr with a Datafusion expression
+        let expr = col("x").gt(lit(10)).and(col("status").eq(lit("active")));
+        let data = table
+            .query()
+            .only_if_expr(expr)
+            .execute()
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].as_ref().unwrap(), &expected_data);
     }
 }
