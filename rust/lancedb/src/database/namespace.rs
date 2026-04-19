@@ -22,10 +22,11 @@ use lance_namespace_impls::ConnectBuilder;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 
-use crate::connection::PushdownOperation;
+use crate::connection::NamespaceClientPushdownOperation;
 use crate::database::ReadConsistency;
 use crate::error::{Error, Result};
 use crate::table::NativeTable;
+use lance::dataset::WriteMode;
 
 use super::{
     BaseTable, CloneTableRequest, CreateTableMode, CreateTableRequest as DbCreateTableRequest,
@@ -44,7 +45,7 @@ pub struct LanceNamespaceDatabase {
     // database URI
     uri: String,
     // Operations to push down to the namespace server
-    pushdown_operations: HashSet<PushdownOperation>,
+    pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
     // Namespace implementation type (e.g., "dir", "rest")
     ns_impl: String,
     // Namespace properties used to construct the namespace client
@@ -52,13 +53,34 @@ pub struct LanceNamespaceDatabase {
 }
 
 impl LanceNamespaceDatabase {
+    pub fn from_namespace_client(
+        namespace_client: Arc<dyn LanceNamespace>,
+        namespace_client_impl: String,
+        namespace_client_properties: HashMap<String, String>,
+        storage_options: HashMap<String, String>,
+        read_consistency_interval: Option<std::time::Duration>,
+        session: Option<Arc<lance::session::Session>>,
+        namespace_client_pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
+    ) -> Self {
+        Self {
+            namespace: namespace_client,
+            storage_options,
+            read_consistency_interval,
+            session,
+            uri: format!("namespace://{}", namespace_client_impl),
+            pushdown_operations: namespace_client_pushdown_operations,
+            ns_impl: namespace_client_impl,
+            ns_properties: namespace_client_properties,
+        }
+    }
+
     pub async fn connect(
         ns_impl: &str,
         ns_properties: HashMap<String, String>,
         storage_options: HashMap<String, String>,
         read_consistency_interval: Option<std::time::Duration>,
         session: Option<Arc<lance::session::Session>>,
-        pushdown_operations: HashSet<PushdownOperation>,
+        pushdown_operations: HashSet<NamespaceClientPushdownOperation>,
     ) -> Result<Self> {
         let mut builder = ConnectBuilder::new(ns_impl);
         for (key, value) in ns_properties.clone() {
@@ -163,37 +185,23 @@ impl Database for LanceNamespaceDatabase {
     async fn create_table(&self, request: DbCreateTableRequest) -> Result<Arc<dyn BaseTable>> {
         let mut table_id = request.namespace_path.clone();
         table_id.push(request.name.clone());
-        let describe_request = DescribeTableRequest {
-            id: Some(table_id.clone()),
-            ..Default::default()
-        };
-
-        let describe_result = self.namespace.describe_table(describe_request).await;
+        let mut existing_table = None;
 
         match request.mode {
-            CreateTableMode::Create => {
-                if describe_result.is_ok() {
-                    return Err(Error::TableAlreadyExists {
-                        name: request.name.clone(),
-                    });
-                }
-            }
+            CreateTableMode::Create => {}
             CreateTableMode::Overwrite => {
-                if describe_result.is_ok() {
-                    // Drop the existing table - must succeed
-                    let drop_request = DropTableRequest {
-                        id: Some(table_id.clone()),
-                        ..Default::default()
-                    };
-                    self.namespace
-                        .drop_table(drop_request)
-                        .await
-                        .map_err(|e| Error::Runtime {
-                            message: format!("Failed to drop existing table for overwrite: {}", e),
-                        })?;
-                }
+                let describe_request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                };
+                existing_table = self.namespace.describe_table(describe_request).await.ok();
             }
             CreateTableMode::ExistOk(_) => {
+                let describe_request = DescribeTableRequest {
+                    id: Some(table_id.clone()),
+                    ..Default::default()
+                };
+                let describe_result = self.namespace.describe_table(describe_request).await;
                 if describe_result.is_ok() {
                     let native_table = NativeTable::open_from_namespace(
                         self.namespace.clone(),
@@ -221,20 +229,54 @@ impl Database for LanceNamespaceDatabase {
         };
 
         let (location, initial_storage_options, managed_versioning) = {
-            let response = self.namespace.declare_table(declare_request).await?;
-            let loc = response.location.ok_or_else(|| Error::Runtime {
-                message: "Table location is missing from declare_table response".to_string(),
-            })?;
-            // Use storage options from response, fall back to self.storage_options
-            let opts = response
-                .storage_options
-                .or_else(|| Some(self.storage_options.clone()))
-                .filter(|o| !o.is_empty());
-            (loc, opts, response.managed_versioning)
+            if let Some(response) = existing_table {
+                let loc = response.location.ok_or_else(|| Error::Runtime {
+                    message: "Table location is missing from describe_table response".to_string(),
+                })?;
+                let opts = response
+                    .storage_options
+                    .or_else(|| Some(self.storage_options.clone()))
+                    .filter(|o| !o.is_empty());
+                (loc, opts, response.managed_versioning)
+            } else {
+                let response = self
+                    .namespace
+                    .declare_table(declare_request)
+                    .await
+                    .map_err(|e| {
+                        let err_str = e.to_string();
+                        if matches!(request.mode, CreateTableMode::Create)
+                            && (err_str.contains("already exists")
+                                || err_str.contains("TableAlreadyExists")
+                                || err_str.contains("table already exists"))
+                        {
+                            Error::TableAlreadyExists {
+                                name: request.name.clone(),
+                            }
+                        } else {
+                            Error::Runtime {
+                                message: format!("Failed to declare table: {}", e),
+                            }
+                        }
+                    })?;
+                let loc = response.location.ok_or_else(|| Error::Runtime {
+                    message: "Table location is missing from declare_table response".to_string(),
+                })?;
+                // Use storage options from response, fall back to self.storage_options
+                let opts = response
+                    .storage_options
+                    .or_else(|| Some(self.storage_options.clone()))
+                    .filter(|o| !o.is_empty());
+                (loc, opts, response.managed_versioning)
+            }
         };
 
         // Build write params with storage options and commit handler
         let mut params = request.write_options.lance_write_params.unwrap_or_default();
+
+        if matches!(request.mode, CreateTableMode::Overwrite) {
+            params.mode = WriteMode::Overwrite;
+        }
 
         // Set up storage options if provided
         if let Some(storage_opts) = initial_storage_options {
